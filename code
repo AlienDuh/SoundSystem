@@ -1,0 +1,134 @@
+import sounddevice as sd
+import numpy as np
+import aubio
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import time
+import random
+from scipy.signal import butter, filtfilt
+
+# Settings
+samplerate = 44100
+win_s = 512  # Larger window for better accuracy
+hop_s = win_s // 2
+device_name = "BlackHole 2ch"  # Change if needed
+
+# BPM Reset Threshold and Window Size for smoothing
+bpm_window_size = 5
+bpm_reset_threshold = 20  # Larger threshold for song change detection
+bpm_threshold = 10  # Smaller threshold for beat detection
+
+# Aubio tempo detection with higher sensitivity
+# Here we adjust tolerance by tuning the aubio parameters directly
+tempo_o = aubio.tempo("default", win_s, hop_s, samplerate)
+tempo_o.set_silence(0.005)  # Lower the silence threshold for more sensitive beat detection
+
+# Visualization variables
+num_bars = 5
+bar_heights = [0.2] * num_bars
+bar_targets = [0.2] * num_bars
+decay_rate = 0.85
+growth_factor = 2.0
+
+# BPM Tracking
+last_beat_time = None
+bpm_estimates = []
+
+# Matplotlib setup
+fig, ax = plt.subplots(figsize=(6, 4))
+bars = ax.bar(range(num_bars), bar_heights,
+              color=['#FF0000', '#FF7F00', '#FFFF00', '#00FF00', '#0000FF'])  # Bright colors
+
+ax.set_ylim(0, 1)
+ax.set_xticks([])
+ax.set_yticks([])
+
+
+def butter_highpass(cutoff, fs, order=5):
+    nyquist = 0.5 * fs
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(order, normal_cutoff, btype='high', analog=False)
+    return b, a
+
+
+def highpass_filter(data, cutoff, fs, order=5):
+    b, a = butter_highpass(cutoff, fs, order)
+    return filtfilt(b, a, data)
+
+
+def update(frame):
+    """ Smoothly adjust bar heights """
+    global bar_heights
+
+    for i in range(num_bars):
+        # Move bars toward target quickly
+        bar_heights[i] += (bar_targets[i] - bar_heights[i]) * decay_rate
+        bars[i].set_height(bar_heights[i])
+
+        # Shrink down bars faster after beats
+        if bar_heights[i] > 0.2:
+            bar_heights[i] *= decay_rate
+
+    return bars
+
+
+def detect_bpm():
+    """ Returns the current learned BPM estimate """
+    if len(bpm_estimates) < 3:
+        return None
+    return np.median(bpm_estimates)
+
+
+def audio_callback(indata, frames, time_info, status):
+    """ Processes audio, detects beats, and updates bars """
+    global last_beat_time, bpm_estimates, bar_targets
+
+    if status:
+        print("Audio callback status:", status)
+
+    # Preprocessing: Apply high-pass filter to remove low-frequency noise
+    samples = np.mean(indata, axis=1) if indata.ndim > 1 else indata.flatten()
+    samples = samples.astype(np.float32)
+    samples = highpass_filter(samples, cutoff=80, fs=samplerate)  # Apply filter
+
+    for i in range(0, len(samples), hop_s):
+        chunk = samples[i:i + hop_s]
+        if len(chunk) < hop_s:
+            continue
+
+        if tempo_o(chunk):
+            # Beat detected
+            current_time = time.time()
+            print("BEAT!")
+
+            # Push bar heights up more dramatically on beats
+            bar_targets = [random.uniform(0.8, 1.0) for _ in range(num_bars)]
+
+            if last_beat_time is not None:
+                interval = current_time - last_beat_time
+                bpm = 60.0 / interval
+
+                if 40 <= bpm <= 240:
+                    bpm_estimates.append(bpm)
+                    if len(bpm_estimates) > bpm_window_size:
+                        bpm_estimates.pop(0)
+
+                    avg_bpm = detect_bpm()
+                    if avg_bpm:
+                        print(f"Estimated BPM: {avg_bpm:.2f}")
+
+                        if len(bpm_estimates) >= bpm_window_size:
+                            bpm_diff = abs(bpm - avg_bpm)
+                            if bpm_diff > bpm_reset_threshold:
+                                print("⚠️ Significant song change detected! Resetting BPM tracking.")
+                                bpm_estimates.clear()
+
+            last_beat_time = current_time
+
+
+# Start audio stream
+print("Real-time beat visualization started. Press Ctrl+C to stop.")
+
+with sd.InputStream(device=device_name, channels=2, samplerate=samplerate, callback=audio_callback):
+    ani = animation.FuncAnimation(fig, update, interval=10, blit=False)  # Faster updates
+    plt.show()
